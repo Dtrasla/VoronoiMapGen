@@ -1,0 +1,6 @@
+target/
+*.svg
+Cargo.lock
+.vscode
+.DS_Store
+.idea

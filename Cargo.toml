@@ -1,0 +1,11 @@
+[package]
+name = "mapGenerator"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = "4.5.47"
+delaunator = "1.0.2"
+ferris-says = "0.3.1"
+rand = "0.9.2"
+voronoice = "0.2.0"
