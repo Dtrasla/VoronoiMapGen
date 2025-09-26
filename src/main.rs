@@ -1,7 +1,8 @@
 
-use rand::{rngs::ThreadRng, Rng};
+use rand::{rngs::ThreadRng, Rng, seq::SliceRandom};
 use voronoice::{BoundingBox, ClipBehavior, Point, Voronoi, VoronoiBuilder, VoronoiCell};
 use delaunator::{EMPTY, next_halfedge};
+use std::collections::{HashSet, VecDeque};
 
 const CANVAS_SIZE: f64 = 2200.;
 const CANVAS_MARGIN: f64 = 0.;
@@ -15,22 +16,21 @@ const TRIANGULATION_HULL_COLOR: &str = "green";
 const TRIANGULATION_LINE_COLOR: &str = "grey";
 const JITTER_RANGE_VALUE: f64 = 5.;
 const SAND_COLOR: &str = "SandyBrown";
+const OCEAN_COLOR: &str = "steelblue";
+const FRESH_WATER_COLOR: &str = "lightskyblue";
 const GAMMA : f32 = 0.7; // Probability of continuing land growth
 
 
 fn main() {
-    let n = 4096;//16384;
+    let n = 16384;
     let sites = generate_points(n);
 
     //let sites: Vec<_> = points.iter().map(|(x, y)| Point { x: *x, y: *y }).collect();
 
     let bbox = BoundingBox::new(Point { x: (0.0), y: (0.0) }, 2100.0, 2100.0);
-    println!("bbox: {:?}", bbox.center());
     let transform = build_transformation(&sites);
 
     let sites: Vec<Point> = sites.iter().map(|&[x, y]| Point { x, y }).collect();
-    let cell_indices = pick_island_cells(&sites, n/6 , bbox.width() - 400.0, bbox.height() - 400.0);
-
 
     let diagram = VoronoiBuilder::default()
         .set_sites(sites.clone())
@@ -40,21 +40,17 @@ fn main() {
         .unwrap();
 
     
+    let n = diagram.cells().len();
+    let mut land: Vec<usize> = Vec::with_capacity(n); 
+    let mut salt_water: Vec<usize> = Vec::with_capacity(n);
+    let mut fresh_water: Vec<usize> = Vec::with_capacity(n);
 
-    let cells = islands(&diagram, 4);
-    // Pick some cells to form an island
-    //println!("Iterator: {:?}", diagram.cell(40).iter_neighbors().map());
-    //diagram.cell(0).site();
-    
-    let svg = voronoi_to_svg(&diagram, &transform, &cells);
+    islands(&diagram, 7, &mut land, &mut salt_water, &mut fresh_water);
 
-    for vert in diagram.cell(0).iter_vertices() {
-        println!("{:?} {:?}", vert.x, vert.y);
-    }
+    let svg = voronoi_to_svg(&diagram, &transform, &land, &salt_water, &fresh_water);
 
     std::fs::write("voronoi.svg", svg).expect("write svg");
     println!("Wrote voronoi.svg");
-    //println!("{:?}", diagram);
 }
 
 
@@ -75,8 +71,6 @@ fn generate_points(n: usize) -> Vec<[f64; 2]> {
         points.push((x, y));
     }
 
-    //points
-
     (0..n).map(move |_| [rng.sample(x_range), rng.sample(y_range)])
         .collect::<Vec<_>>()
 }
@@ -84,43 +78,39 @@ fn generate_points(n: usize) -> Vec<[f64; 2]> {
 
 /*TERRAIN GENERATION */
 
-fn islands(voronoi: &Voronoi, k: usize) -> Vec<usize>{
+fn islands(voronoi: &Voronoi, k: usize, land_cells: &mut Vec<usize>, salt_water: &mut Vec<usize>, fresh_water: &mut Vec<usize>) {
     let mut rng = rand::rng();
     let n = voronoi.cells().len();
-    let mut cells: Vec<usize> = Vec::with_capacity(n); 
 
-    for i in 0..k {
-
+    // Generate blobs of land randomly using recursion and gamma as chance of land expanding
+    for _ in 0..k {
         let cell_index = rng.random_range(0..n);
         let cell = voronoi.cell(cell_index);
         //land_max_depth(voronoi, &cell, &mut cells, cell_index, &mut rng, 20);
-        land(voronoi, &cell, &mut cells, cell_index, &mut rng);
+        land(voronoi, &cell, land_cells, cell_index, &mut rng);
     }
 
-    cells
+    // Generate water cells based on islands, using same recursive approach but lower probability
+    generate_water_from_empty_cells(voronoi, fresh_water, salt_water, land_cells);
+
 }
 
-// From mainland points, recursively walk to neighbors, adding to land until some stopping condition
+// From mainland points, recursively walk to neighbors, depends on GAMMA probability to expand land
 fn land (diagram: &Voronoi, cell: &VoronoiCell, cells: &mut Vec<usize>, cellpos: usize, rng: &mut ThreadRng) {
-    //println!("Visiting cell {:?}", cellpos);
     cells.push(cellpos);
 
     for neighbor in cell.iter_neighbors() {    
-        let tuple = diagram.cell(neighbor).site_position().clone();
-
         if (rng.random_range(0.0..1.0) > GAMMA) && !cells.contains(&neighbor) {
             land(diagram, &diagram.cell(neighbor), cells, neighbor, rng);
         }
     }
 }
 
-
+// Useful for lower GAMMA values to avoid enormous landmasses
 fn land_max_depth (diagram: &Voronoi, cell: &VoronoiCell, cells: &mut Vec<usize>, cellpos: usize, rng: &mut ThreadRng, depth: usize) {
-    println!("Visiting cell {:?}", cellpos);
     cells.push(cellpos);
 
     if depth == 0 {
-        println!("Max depth reached at cell {:?}", cellpos);
         return; 
     }
     for neighbor in cell.iter_neighbors() {    
@@ -132,61 +122,88 @@ fn land_max_depth (diagram: &Voronoi, cell: &VoronoiCell, cells: &mut Vec<usize>
     }
 }
 
+pub fn generate_water_from_empty_cells(
+    diagram: &Voronoi,
+    fresh_water: &mut Vec<usize>,
+    salt_water: &mut Vec<usize>,
+    island_cells: &mut Vec<usize>,
+) {
+    let island: HashSet<usize> = island_cells.iter().copied().collect();
 
+    // Cells we’ve already labeled as water (fresh or salt) to avoid reprocessing
+    let mut labeled: HashSet<usize> =
+        fresh_water.iter().chain(salt_water.iter()).copied().collect();
 
-use rand::{seq::SliceRandom};
+    // Explore only empty neighbors of land. Each un-labeled empty region gets a single flood fill
+    for &land_idx in &island {
+        let land_cell = diagram.cell(land_idx);
+        for neighbor in land_cell.iter_neighbors() {
+            if island.contains(&neighbor) || labeled.contains(&neighbor) {
+                continue;
+            }
+            // neighbor is an empty cell we haven't labeled yet → flood-fill its component
+            let (component, touches_hull) =
+                flood_fill_empty_component(diagram, neighbor, &island, &labeled);
 
-/// Pick K site indices nearest to a random center (biased “blob”)
-fn pick_island_cells(sites: &[Point], k: usize, bbox_w: f64, bbox_h: f64) -> Vec<usize> {
-    let mut rng = rand::thread_rng();
-    // Random center inside the bbox
-    let cx = rng.gen_range(0.0..700.0);
-    let cy = rng.gen_range(0.0..700.0);
-    let mut idxs: Vec<usize> = (0..sites.len()).collect();
+            // Mark them as labeled (so we never touch these again).
+            labeled.extend(component.iter().copied());
 
-    idxs.sort_by(|&a, &b| {
-        let da = (sites[a].x - cx).hypot(sites[a].y - cy);
-        let db = (sites[b].x - cx).hypot(sites[b].y - cy);
-        da.partial_cmp(&db).unwrap()
-    });
-
-    // Take more than k, then shuffle-drop to add wobbly edges
-    let overshoot = (k as f64 * 1.15) as usize;
-    let mut chosen = idxs.into_iter().take(overshoot.max(k)).collect::<Vec<_>>();
-    println!("{:?}, {:?}", chosen.first(), sites[chosen[0]]);
-
-    chosen.shuffle(&mut rng);
-    chosen.truncate(k);
-    chosen
-}
-
-/*
-fn noisyIsland() {
-    let noise = Perlin::new();
-}
-*/
-
-
-/// Build an SVG <g> where each selected Voronoi cell is a filled polygon.
-/// Use the same fill and no stroke so adjacent cells look like a single island.
-
-/// Convenience: insert a <g> before </svg>
-fn inject_group(mut svg: String, group: &str) -> String {
-    if let Some(pos) = svg.rfind("</svg>") {
-        svg.insert_str(pos, group);
-        svg
-    } else {
-        // Fallback: wrap as an SVG if caller passed only fragments
-        format!(r#"<svg xmlns="http://www.w3.org/2000/svg">{group}</svg>"#)
+            // Push into the appropriate bucket
+            if touches_hull {
+                salt_water.extend(component.iter().copied());
+            } else {
+                fresh_water.extend(component.iter().copied());
+            }
+        }
     }
+
+    dedup_in_place(fresh_water);
+    dedup_in_place(salt_water);
 }
 
+fn flood_fill_empty_component(
+    diagram: &Voronoi,
+    start: usize,
+    island: &HashSet<usize>,
+    labeled: &HashSet<usize>,
+) -> (Vec<usize>, bool) {
+    let mut q = VecDeque::new();
+    let mut seen: HashSet<usize> = HashSet::new();
+    let mut component: Vec<usize> = Vec::new();
+    let mut touches_hull = false;
 
+    q.push_back(start);
+    seen.insert(start);
 
-/* RENDERING */
+    while let Some(idx) = q.pop_front() {
+        let cell = diagram.cell(idx);
+        if cell.is_on_hull() {
+            touches_hull = true;
+        }
 
+        component.push(idx);
 
-pub fn voronoi_to_svg(voronoi: &Voronoi, transform: &Transform, cell_indices: &[usize]) -> String {
+        // Explore neighbors that are also empty (not land) and not yet labeled/seen
+        for nb in cell.iter_neighbors() {
+            if island.contains(&nb) || labeled.contains(&nb) || seen.contains(&nb) {
+                continue;
+            }
+            seen.insert(nb);
+            q.push_back(nb);
+        }
+    }
+
+    (component, touches_hull)
+}
+
+fn dedup_in_place(v: &mut Vec<usize>) {
+    let mut seen = HashSet::new();
+    v.retain(|x| seen.insert(*x));
+}
+
+// RENDERING
+
+pub fn voronoi_to_svg(voronoi: &Voronoi, transform: &Transform, cell_indices: &[usize], salt_water: &[usize], fresh_water: &[usize]) -> String {
     let bounding_box_top_left = transform.transform(&Point { x: voronoi.bounding_box().left(), y: voronoi.bounding_box().top() });
     let bounding_box_side = transform.transform(voronoi.bounding_box().bottom_left()).y - bounding_box_top_left.y;
 
@@ -201,6 +218,8 @@ pub fn voronoi_to_svg(voronoi: &Voronoi, transform: &Transform, cell_indices: &[
         {triangles}
         {circumcenter_circles}
         {islands}
+        {ocean}
+        {fresh}
     </svg>"#,
             width = CANVAS_SIZE,
             height = CANVAS_SIZE,
@@ -208,12 +227,14 @@ pub fn voronoi_to_svg(voronoi: &Voronoi, transform: &Transform, cell_indices: &[
             bb_y = bounding_box_top_left.y,
             bb_width = bounding_box_side,
             bb_height = bounding_box_side,
-            sites = render_point(&transform, voronoi.sites(), SITE_COLOR, false, false),
+            sites = "",//render_point(&transform, voronoi.sites(), SITE_COLOR, false, false),
             circumcenters = "",//render_point(&transform, voronoi.vertices(), CIRCUMCENTER_COLOR, true, true),
-            voronoi_edges =  render_voronoi_edges(&transform, &voronoi),
+            voronoi_edges =  "",//render_voronoi_edges(&transform, &voronoi),
             triangles = "", //render_triangles(&transform, &voronoi, false, true),
             circumcenter_circles = "",//render_circumcenters(&transform, &voronoi),
-            islands = island_group_svg(voronoi, &transform, cell_indices, SAND_COLOR, 0.8)
+            islands = island_group_svg(voronoi, &transform, cell_indices, SAND_COLOR, 1.0),
+            ocean = island_group_svg(voronoi, &transform, salt_water, OCEAN_COLOR, 1.0),
+            fresh = island_group_svg(voronoi, &transform, fresh_water, FRESH_WATER_COLOR, 1.0)
         );
 
         contents
@@ -339,9 +360,6 @@ fn island_group_svg(diagram: &Voronoi, transform: &Transform,cell_indices: &[usi
         let cell = diagram.cell(ci);
         let mut pts = Vec::new();
         for v in cell.iter_vertices() {
-            // If you have a coordinate transform, apply it here:
-            // let (sx, sy) = transform((v.x, v.y));
-            // pts.push(format!("{:.2},{:.2}", sx, sy));
             let v = transform.transform(v);
             pts.push(format!("{:.2},{:.2}", v.x, v.y));
         }
@@ -352,6 +370,7 @@ fn island_group_svg(diagram: &Voronoi, transform: &Transform,cell_indices: &[usi
     s.push_str("</g>");
     s
 }
+
 
 pub struct Transform {
     scale: f64,
