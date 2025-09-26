@@ -2,7 +2,7 @@
 use rand::{rngs::ThreadRng, Rng, seq::SliceRandom};
 use voronoice::{BoundingBox, ClipBehavior, Point, Voronoi, VoronoiBuilder, VoronoiCell};
 use delaunator::{EMPTY, next_halfedge};
-use std::collections::{HashSet, VecDeque};
+use std::{collections::{HashSet, VecDeque}, path};
 
 const CANVAS_SIZE: f64 = 2200.;
 const CANVAS_MARGIN: f64 = 0.;
@@ -15,11 +15,25 @@ const VORONOI_EDGE_COLOR: &str = "blue";
 const TRIANGULATION_HULL_COLOR: &str = "green";
 const TRIANGULATION_LINE_COLOR: &str = "grey";
 const JITTER_RANGE_VALUE: f64 = 5.;
-const SAND_COLOR: &str = "SandyBrown";
+const SAND_COLOR: &str = "peachpuff";
 const OCEAN_COLOR: &str = "steelblue";
 const FRESH_WATER_COLOR: &str = "lightskyblue";
-const GAMMA : f32 = 0.7; // Probability of continuing land growth
+const RIVER_COLOR: &str = "lightseagreen";
+const MAINLAND_COLOR: &str = "olivedrab";
+const GAMMA : f32 = 0.68; // Probability of continuing land growth
+const RIVER_GAMMA: f32 = 0.85;
+const RIVER_EXPANSION: f32 = 0.5;
+const MAX_RIVERS: usize = 5;
+const MAX_STEPS: usize = 1000;
 
+
+const W_DOWN: f64 = 2.0;
+const W_SEA: f64  = 1.0;
+const W_CURVE: f64 = 0.6;
+const W_CONF: f64 = 3.0;   // prefer merging
+const NOISE_JITTER: f64 = 0.1;
+const ALPHA_ELEV: f64 = 1.0; // dist-to-coast weight
+const BETA_NOISE: f64 = 0.35; // noise weight
 
 fn main() {
     let n = 16384;
@@ -45,9 +59,11 @@ fn main() {
     let mut salt_water: Vec<usize> = Vec::with_capacity(n);
     let mut fresh_water: Vec<usize> = Vec::with_capacity(n);
 
-    islands(&diagram, 7, &mut land, &mut salt_water, &mut fresh_water);
+    islands(&diagram, 8, &mut land, &mut salt_water, &mut fresh_water);
+    let rivers = generate_rivers(&diagram, &land, &fresh_water);
+    let coast = separate_coast_and_inland(&diagram, &mut land, &salt_water);
 
-    let svg = voronoi_to_svg(&diagram, &transform, &land, &salt_water, &fresh_water);
+    let svg = voronoi_to_svg(&diagram, &transform, &coast, &land,&salt_water, &fresh_water, &rivers);
 
     std::fs::write("voronoi.svg", svg).expect("write svg");
     println!("Wrote voronoi.svg");
@@ -120,6 +136,24 @@ fn land_max_depth (diagram: &Voronoi, cell: &VoronoiCell, cells: &mut Vec<usize>
             land_max_depth(diagram, &diagram.cell(neighbor), cells, neighbor, rng, depth - 1);
         }
     }
+}
+
+fn separate_coast_and_inland(diagram: &Voronoi, land_cells: &mut Vec<usize>, salt_water: &Vec<usize>) -> Vec<usize> {
+    let mut coast = Vec::with_capacity(land_cells.len());
+    let mut values_to_remove = Vec::new();
+    for cell in &land_cells.clone() {
+        for neighbor in diagram.cell(*cell).iter_neighbors() {
+            if (salt_water.contains(&neighbor)) {
+                coast.push(*cell);
+                values_to_remove.push(*cell);
+                continue;
+            }
+        }
+    }
+
+    land_cells.retain(|x| !values_to_remove.contains(x));
+
+    coast
 }
 
 pub fn generate_water_from_empty_cells(
@@ -201,9 +235,193 @@ fn dedup_in_place(v: &mut Vec<usize>) {
     v.retain(|x| seen.insert(*x));
 }
 
+
+fn land_set(land_cells: &Vec<usize>) -> HashSet<usize> {
+    land_cells.iter().copied().collect()
+}
+
+fn dist_to_coast(diagram: &Voronoi, land: &HashSet<usize>) -> Vec<i32> {
+    // BFS in land graph starting at hull land cells
+    let n = diagram.cells().len();
+    let mut dist = vec![i32::MAX; n];
+    let mut q = VecDeque::new();
+
+    for &ci in land {
+        if diagram.cell(ci).is_on_hull() {
+            dist[ci] = 0;
+            q.push_back(ci);
+        }
+    }
+    while let Some(u) = q.pop_front() {
+        let du = dist[u];
+        for v in diagram.cell(u).iter_neighbors() {
+            if !land.contains(&v) { continue; }
+            if dist[v] == i32::MAX {
+                dist[v] = du + 1;
+                q.push_back(v);
+            }
+        }
+    }
+    dist
+}
+
+// Minimal fBm-ish noise using site coords (replace with `noise` crate if you prefer)
+fn hash_noise(p: &Point) -> f64 {
+    let x = (p.x * 127.1 + p.y * 311.7).sin();
+    let y = (p.x * 269.5 + p.y * 183.3).cos();
+    (x + y) as f64 * 0.5
+}
+
+fn build_elevation(diagram: &Voronoi, land: &HashSet<usize>, dist: &Vec<i32>) -> Vec<f64> {
+    let mut elev = vec![0.0; diagram.cells().len()];
+    let maxd = dist.iter().copied().filter(|d| *d < i32::MAX).max().unwrap_or(1) as f64;
+    for &ci in land {
+        let d = dist[ci] as f64 / maxd;                 // 0 (coast) .. 1 (interior)
+        let n = hash_noise(diagram.cell(ci).site_position());
+        elev[ci] = ALPHA_ELEV * d + BETA_NOISE * n;    // bumpy downhill toward coast
+    }
+    elev
+}
+
+// ---- River generation ----
+
+pub fn generate_rivers(
+    diagram: &Voronoi,
+    land_cells: &Vec<usize>,
+    fresh_water: &Vec<usize>,   // lakes to seed
+) -> Vec<Vec<Point>> {
+    let mut rng = rand::rng();
+    let land = land_set(land_cells);
+    let dsea = dist_to_coast(diagram, &land);
+    let elev = build_elevation(diagram, &land, &dsea);
+    let mut is_river = vec![false; diagram.cells().len()];
+    let mut rivers: Vec<Vec<Point>> = Vec::new();
+
+    // Seeds: any lake neighbor that is land and not already a river
+    for &lake_idx in fresh_water {
+        for nb in diagram.cell(lake_idx).iter_neighbors() {
+            if !land.contains(&nb) || is_river[nb] { continue; }
+
+            if rng.random_range(0.0..1.0) > 0.45 {
+                let mut path_idx = walk_river(diagram, nb, &land, &elev, &dsea, &mut is_river, &mut rng);
+                if path_idx.len() >= 3 {
+                    let mut poly: Vec<Point> = path_idx
+                        .drain(..)
+                        .map(|ci| diagram.cell(ci).site_position().clone())
+                        .collect();
+                    poly = chaikin_smooth(poly, 2);
+                    rivers.push(poly);
+                }
+            }
+        }
+    }
+    rivers
+}
+
+fn walk_river(
+    diagram: &Voronoi,
+    start: usize,
+    land: &HashSet<usize>,
+    elev: &Vec<f64>,
+    dsea: &Vec<i32>,
+    is_river: &mut Vec<bool>,
+    rng: &mut ThreadRng,
+) -> Vec<usize> {
+    let mut path = Vec::new();
+    let mut visited = HashSet::new();
+    let mut cur = start;
+    let mut prev_dir: Option<(f64,f64)> = None;
+    let mut steps = 0usize;
+
+    while steps < MAX_STEPS {
+        steps += 1;
+        let cell = diagram.cell(cur);
+        path.push(cur);
+        is_river[cur] = true;
+        visited.insert(cur);
+
+        if cell.is_on_hull() { break; } // reached the sea
+
+        // Candidate next land neighbors
+        let mut best = None;
+        let e_cur = elev[cur];
+        let d_cur = dsea[cur];
+
+        for nb in cell.iter_neighbors() {
+            if !land.contains(&nb) || visited.contains(&nb) { continue; }
+
+            // prefer merging into an existing river
+            let conf = if is_river[nb] { 1.0 } else { 0.0 };
+
+            // downhill & to-sea terms
+            let e_gain = (e_cur - elev[nb]).max(0.0);
+            let d_gain = (d_cur - dsea[nb]) as f64;
+
+            // curvature term
+            let dir = {
+                let a = cell.site_position();
+                
+                let b = diagram.cell(nb).site_position().clone();
+                let vx = (b.x - a.x) as f64;
+                let vy = (b.y - a.y) as f64;
+                let len = (vx*vx + vy*vy).sqrt().max(1e-6);
+                (vx/len, vy/len)
+            };
+            let curve = if let Some(pd) = prev_dir {
+                pd.0 * dir.0 + pd.1 * dir.1   // cosine
+            } else { 0.0 };
+
+            let jitter = (rng.random_range(-1.0..1.0) as f64) * NOISE_JITTER;
+
+            let score = W_DOWN*e_gain + W_SEA*d_gain + W_CURVE*curve + W_CONF*conf + jitter;
+
+            if best.map_or(true, |(_, s, _)| score > s) {
+                best = Some((nb, score, dir));
+            }
+        }
+
+        match best {
+            None => break, // dead end
+            Some((next_idx, _, dir)) => {
+                // If next is already a river, *snap* and stop (confluence).
+                if is_river[next_idx] {
+                    path.push(next_idx);
+                    break;
+                }
+                prev_dir = Some(dir);
+                cur = next_idx;
+            }
+        }
+    }
+
+    path
+}
+
+// ---- Light smoothing for nicer meanders ----
+fn chaikin_smooth(mut poly: Vec<Point>, iterations: usize) -> Vec<Point> {
+    for _ in 0..iterations {
+        if poly.len() < 3 { break; }
+        let mut out = Vec::with_capacity(poly.len()*2);
+        out.push(poly[0].clone()); // preserve ends
+        for i in 0..poly.len()-1 {
+            let p = &poly[i];
+            let q = &poly[i+1];
+            let p1 = Point { x: 0.75*p.x + 0.25*q.x, y: 0.75*p.y + 0.25*q.y };
+            let q1 = Point { x: 0.25*p.x + 0.75*q.x, y: 0.25*p.y + 0.75*q.y };
+            out.push(p1);
+            out.push(q1);
+        }
+        out.push(poly[poly.len()-1].clone());
+        poly = out;
+    }
+    poly
+}
+
+
+
 // RENDERING
 
-pub fn voronoi_to_svg(voronoi: &Voronoi, transform: &Transform, cell_indices: &[usize], salt_water: &[usize], fresh_water: &[usize]) -> String {
+pub fn voronoi_to_svg(voronoi: &Voronoi, transform: &Transform, coast: &[usize], mainland: &[usize],salt_water: &[usize], fresh_water: &[usize], rivers: &[Vec<Point>]) -> String {
     let bounding_box_top_left = transform.transform(&Point { x: voronoi.bounding_box().left(), y: voronoi.bounding_box().top() });
     let bounding_box_side = transform.transform(voronoi.bounding_box().bottom_left()).y - bounding_box_top_left.y;
 
@@ -217,9 +435,11 @@ pub fn voronoi_to_svg(voronoi: &Voronoi, transform: &Transform, cell_indices: &[
         {voronoi_edges}
         {triangles}
         {circumcenter_circles}
-        {islands}
+        {coast}
+        {mainland}
         {ocean}
         {fresh}
+        {rivers}
     </svg>"#,
             width = CANVAS_SIZE,
             height = CANVAS_SIZE,
@@ -232,9 +452,11 @@ pub fn voronoi_to_svg(voronoi: &Voronoi, transform: &Transform, cell_indices: &[
             voronoi_edges =  "",//render_voronoi_edges(&transform, &voronoi),
             triangles = "", //render_triangles(&transform, &voronoi, false, true),
             circumcenter_circles = "",//render_circumcenters(&transform, &voronoi),
-            islands = island_group_svg(voronoi, &transform, cell_indices, SAND_COLOR, 1.0),
+            coast = island_group_svg(voronoi, &transform, coast, SAND_COLOR, 1.0),
+            mainland = island_group_svg(voronoi, &transform, mainland, MAINLAND_COLOR, 1.0),
             ocean = island_group_svg(voronoi, &transform, salt_water, OCEAN_COLOR, 1.0),
-            fresh = island_group_svg(voronoi, &transform, fresh_water, FRESH_WATER_COLOR, 1.0)
+            fresh = island_group_svg(voronoi, &transform, fresh_water, FRESH_WATER_COLOR, 1.0),
+            rivers = rivers_svg_from_points_cased(&transform, rivers, FRESH_WATER_COLOR, "white", 3.0, 5.0, 1.0, 0.3)
         );
 
         contents
@@ -371,6 +593,50 @@ fn island_group_svg(diagram: &Voronoi, transform: &Transform,cell_indices: &[usi
     s
 }
 
+pub fn rivers_svg_from_points(
+    transform: &Transform,
+    rivers: &[Vec<Point>],
+    stroke: &str,
+    width: f64,
+    opacity: f32,
+) -> String {
+    let mut s = format!(
+        r#"<g fill="none" stroke="{stroke}" stroke-width="{width}" stroke-linecap="round" stroke-linejoin="round" opacity="{opacity}">"#
+    );
+
+    for poly in rivers {
+        if poly.len() < 2 { continue; }
+        let pts: Vec<String> = poly.iter()
+            .map(|p| {
+                let t = transform.transform(p);
+                format!("{:.2},{:.2}", t.x, t.y)
+            })
+            .collect();
+        s.push_str(&format!(r#"<polyline points="{}"/>"#, pts.join(" ")));
+    }
+
+    s.push_str("</g>");
+    s
+}
+
+/// Same as above, but draws a thicker "bank" under-stroke for contrast.
+pub fn rivers_svg_from_points_cased(
+    transform: &Transform,
+    rivers: &[Vec<Point>],
+    stroke_main: &str,
+    stroke_casing: &str,
+    width_main: f64,
+    width_casing: f64,
+    opacity_main: f32,
+    opacity_casing: f32,
+) -> String {
+    // Draw casing first (under), then the main line (over).
+    let under = rivers_svg_from_points(transform, rivers, stroke_casing, width_casing, opacity_casing);
+    let over  = rivers_svg_from_points(transform, rivers, stroke_main,   width_main,   opacity_main);
+    format!("{under}{over}")
+}
+
+
 
 pub struct Transform {
     scale: f64,
@@ -389,8 +655,6 @@ impl Transform {
             y: self.scale * (p.y *  self.rotation.cos() + p.x * self.rotation.sin()) + self.offset.y,
         }
     }
-
-    
 }
 
 
